@@ -118,7 +118,9 @@ pub fn capture<T: Tap>(
             continue;
         }
         let words = drain_region(tap, node, r)?;
-        if let Some(sr) = decoder.to_records(r, &words) {
+        // pass the header so the decoder records only THIS capture's valid
+        // events, never stale ring words a CLEAR left behind (the fix)
+        if let Some(sr) = decoder.to_records(r, &words, &head) {
             payload = Some(sr);
             break;
         }

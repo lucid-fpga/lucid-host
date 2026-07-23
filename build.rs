@@ -71,10 +71,23 @@ fn dep_stack() -> String {
 
 fn main() {
     let rev = git(&["rev-parse", "--short=8", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = match git(&["status", "--porcelain"]) {
-        Some(s) if !s.is_empty() => "dirty",
-        Some(_) => "clean",
-        None => "unknown",
+    // The dirty flag must distinguish success-with-EMPTY-output (a clean tree —
+    // the common case) from a failed command (unknown). The `git()` helper above
+    // collapses empty output to None, which is right for `rev-parse` but wrong
+    // here: a clean `git status --porcelain` is empty and MUST read `clean`, not
+    // `unknown` (the header quirk). So this check runs git directly.
+    let dirty = match Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                "clean"
+            } else {
+                "dirty"
+            }
+        }
+        _ => "unknown",
     };
 
     println!("cargo:rustc-env=LUCID_HOST_REV={rev}");

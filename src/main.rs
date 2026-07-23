@@ -151,7 +151,11 @@ fn run_device(cmd: &str, args: &[String]) -> Result<(), HostError> {
                 .map_err(|_| HostError::Usage("region index must be a number".into()))?;
             let words = host::drain_region(&mut tap, &a.node, region)?;
             match decoder {
-                Some(d) => println!("{}", d.render_region(region, &words)),
+                Some(d) => {
+                    // the decoder renders only valid events, so it needs the header
+                    let head = host::drain_region(&mut tap, &a.node, d.header_region())?;
+                    println!("{}", d.render_region(region, &words, &head));
+                }
                 None => println!("{}", render::raw_region(region, &words)),
             }
         }

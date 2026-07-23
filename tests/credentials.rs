@@ -36,12 +36,64 @@ fn sample_ring() -> Vec<u32> {
     w
 }
 
+/// `GOLDEN_HEAD` with `event_count` and `write_index` set to `n` — so
+/// `valid_events` knows how many of the ring's words belong to this capture.
+fn head_with_count(n: u32) -> [u32; 16] {
+    let mut h = GOLDEN_HEAD;
+    h[13] = n; // EVENT_COUNT
+    h[14] = n; // WRITE_INDEX
+    h
+}
+
 fn sample_capture() -> Capture {
     let (schema, records) = O1Decoder
-        .to_records(o1host::REGION_RING, &sample_ring())
+        .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
         .expect("O1 RING converts to native records");
     let header = O1Decoder.header_summary(&GOLDEN_HEAD);
     Capture::new(RunMode::Sim, 0x0001, 1, 1, 74_250_000, None, header, schema, records)
+}
+
+// ---- the fix: only THIS capture's valid events, never stale ring words ----
+
+#[test]
+fn the_container_records_only_valid_events_never_stale_ring_words() {
+    // Reproduce the bench finding at the desk: a ring where a CLEAR reset
+    // the counters to N=2 and 2 NEW events were written at positions 0..2,
+    // OVERWRITING the first 2 of a previous capture — but the previous capture's
+    // events at positions 2..5 LINGER (CLEAR does not scrub the ring words).
+    let mut polluted = Vec::new();
+    polluted.extend(event_words(500, 0x0000_0000, 0x0000_0082, 1, 0, 10)); // new #1
+    polluted.extend(event_words(604, 0x1000_0000, 0x0000_0010, 1, 0, 11)); // new #2
+    polluted.extend(event_words(100, 0xF800_0000, 0x0000_00AA, 1, 0, 1)); // stale
+    polluted.extend(event_words(204, 0xF800_0004, 0x0000_00BB, 1, 0, 2)); // stale
+    polluted.extend(event_words(308, 0xF800_0008, 0x0000_00CC, 1, 0, 3)); // stale
+    let header = head_with_count(2); // the fabric says: 2 events this capture
+
+    // OLD behaviour (decode_all over the whole region) OVER-COUNTS — the disease:
+    let over = o1host::Event::decode_all(&polluted)
+        .iter()
+        .filter(|e| !e.is_empty())
+        .count();
+    assert_eq!(over, 5, "decode_all sees the stale words too — the pollution");
+
+    // THE FIX: to_records records only the header's valid_events == 2, and they
+    // are exactly the NEW events (seq 10, 11), not the stale ones.
+    let (_schema, records) = O1Decoder
+        .to_records(o1host::REGION_RING, &polluted, &header)
+        .expect("RING converts");
+    assert_eq!(records.len(), 2, "record count EQUALS the header event_count");
+    // seq is packed at payload bits [76..96]
+    let seqs: Vec<u32> = records.iter().map(|r| (r.payload >> 76) as u32 & 0xF_FFFF).collect();
+    assert_eq!(seqs, vec![10, 11], "the records are exactly THIS capture's new events");
+}
+
+#[test]
+fn a_fresh_ring_capture_is_unaffected_by_the_fix() {
+    // capture-1 class: event_count == the ring's real contents, no stale words.
+    let (_s, records) = O1Decoder
+        .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
+        .expect("RING converts");
+    assert_eq!(records.len(), 2, "a fresh-ring count is unchanged by the fix");
 }
 
 // ---- refuse-before-use maps to typed errors that NAME the mismatch ----
@@ -150,7 +202,7 @@ fn an_instrument_with_no_decoder_refuses_ctrl() {
         fn instrument_id(&self) -> u16 { 0xFFFF }
         fn name(&self) -> &'static str { "bare" }
         fn render_header(&self, _: &[u32]) -> Result<String, HostError> { Ok(String::new()) }
-        fn render_region(&self, _: u8, _: &[u32]) -> String { String::new() }
+        fn render_region(&self, _: u8, _: &[u32], _: &[u32]) -> String { String::new() }
         fn header_region(&self) -> u8 { 0 }
     }
     assert_eq!(

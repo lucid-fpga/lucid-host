@@ -46,6 +46,22 @@ fn pack_o1_event(e: &o1host::Event) -> u128 {
         | ((u128::from(e.seq) & 0xF_FFFF) << 76)
 }
 
+/// The events that belong to THIS capture — `Header::valid_events`, authoritative
+/// via the header's `event_count`/`write_index`, never the whole ring region.
+///
+/// This is the one seam where a capture's identity is decided. `CLEAR` resets the
+/// recorder's counters but does NOT scrub the ring words, so decoding the whole
+/// region (`Event::decode_all`) would re-count a previous capture's events — the
+/// bench finding (fabric `event_count` said 1047, the region held 2119
+/// non-empty words). Reading only `valid_events` is the fix, in one place. Returns
+/// empty if the header will not decode.
+fn valid_ring_events(ring_words: &[u32], header_words: &[u32]) -> Vec<o1host::Event> {
+    match o1host::Header::decode(header_words) {
+        Ok(h) => h.valid_events(ring_words),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// A ring overflow policy, in host-generic terms (the decoder maps it to the
 /// instrument's own CTRL encoding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +109,10 @@ pub trait Decoder {
     /// Decode and render the header region's words. `Err(Decode)` names the
     /// malformation (HGT4) rather than rendering a guess.
     fn render_header(&self, head_words: &[u32]) -> Result<String, HostError>;
-    /// Render a data region's words.
-    fn render_region(&self, region: u8, words: &[u32]) -> String;
+    /// Render a data region's words. `header_words` is the instrument's header
+    /// region, so a decoder can render only THIS capture's valid events (never
+    /// stale ring words a `CLEAR` left behind).
+    fn render_region(&self, region: u8, words: &[u32], header_words: &[u32]) -> String;
     /// Which region carries this instrument's header block.
     fn header_region(&self) -> u8;
 
@@ -131,12 +149,14 @@ pub trait Decoder {
     /// Convert a data region's words into NATIVE lucid-trace records plus the
     /// schema describing them — the capture container's payload (HGT6). This is
     /// where the instrument's event packing meets the suite's record format, so
-    /// it lives in the instrument's decoder, never in the host. `None` if the
-    /// region has no record structure (e.g. a header region).
+    /// it lives in the instrument's decoder, never in the host. `header_words`
+    /// is the header region, so only THIS capture's valid events are recorded —
+    /// never stale ring words. `None` if the region has no record structure.
     fn to_records(
         &self,
         _region: u8,
         _words: &[u32],
+        _header_words: &[u32],
     ) -> Option<(lucid_trace::Schema, Vec<lucid_trace::RawRecord>)> {
         None
     }
@@ -168,20 +188,14 @@ impl Decoder for O1Decoder {
         Ok(render::o1_header(&h))
     }
 
-    fn render_region(&self, region: u8, words: &[u32]) -> String {
+    fn render_region(&self, region: u8, words: &[u32], header_words: &[u32]) -> String {
         if region != o1host::REGION_RING {
             return render::raw_region(region, words);
         }
-        let evs = o1host::Event::decode_all(words);
-        let empty = evs.iter().filter(|e| e.is_empty()).count();
-        let nonzero = words.iter().filter(|w| **w != 0).count();
-        let mut s = format!(
-            "{} events, {} empty, non-zero words {}",
-            evs.len(),
-            empty,
-            nonzero
-        );
-        for e in evs.iter().filter(|e| !e.is_empty()) {
+        // only THIS capture's valid events — never stale post-CLEAR ring words
+        let evs = valid_ring_events(words, header_words);
+        let mut s = format!("{} events (valid_events, from the header)", evs.len());
+        for e in &evs {
             s.push_str(&format!(
                 "\n  t={:>10} {:<12} addr=0x{:08X} data=0x{:08X} seq={}",
                 e.timestamp,
@@ -244,16 +258,22 @@ impl Decoder for O1Decoder {
         Ok((words, c.nonce))
     }
 
-    fn to_records(&self, region: u8, words: &[u32]) -> Option<(Schema, Vec<RawRecord>)> {
+    fn to_records(
+        &self,
+        region: u8,
+        words: &[u32],
+        header_words: &[u32],
+    ) -> Option<(Schema, Vec<RawRecord>)> {
         if region != o1host::REGION_RING {
             return None;
         }
         // core_clock_hz is not in the ring words; the container header carries
         // the timestamp domain, and the schema's copy is filled by the writer.
         let schema = o1_event_schema(0);
-        let raws = o1host::Event::decode_all(words)
+        // only THIS capture's valid events — the container never banks stale
+        // ring words a CLEAR left behind (the fix, in one place).
+        let raws = valid_ring_events(words, header_words)
             .iter()
-            .filter(|e| !e.is_empty())
             .map(|e| RawRecord {
                 tag: O1_EVENT_TAG,
                 timestamp: e.timestamp,

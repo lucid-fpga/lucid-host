@@ -280,6 +280,29 @@ fn run_show(args: &[String]) -> Result<(), HostError> {
             }
         }
     }
+    // `show <file> boot` runs OGT2 — the after-the-fact boot decoder — and prints
+    // the reconstructed handshake, descriptor table and deliveries as machine-
+    // parseable lines (a leading tag per row) so the boot-record generator renders
+    // its tables from this output rather than re-decoding the container itself.
+    if args.iter().any(|a| a == "boot") {
+        let rec = lucid_host::boot::decode(&cap.records, &cap.schema);
+        let mut prev_ts = 0u32;
+        for (i, c) in rec.commands.iter().enumerate() {
+            let gap = if i == 0 { 0 } else { c.timestamp.wrapping_sub(prev_ts) };
+            prev_ts = c.timestamp;
+            println!(
+                "CMD seq={} t={} gap={} code=0x{:04X} name=\"{}\" p0=0x{:08X} p1=0x{:08X}",
+                c.seq, c.timestamp, gap, c.code,
+                lucid_host::boot::command_name(c.code), c.params[0], c.params[1]
+            );
+        }
+        for de in &rec.descriptors {
+            println!("DESC slot_id={} size=0x{:08X} seq={}", de.slot_id, de.size, de.seq);
+        }
+        for dl in &rec.deliveries {
+            println!("DELIVERY base=0x{:08X} writes={} first_seq={}", dl.base, dl.writes, dl.first_seq);
+        }
+    }
     Ok(())
 }
 

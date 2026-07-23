@@ -272,6 +272,107 @@ impl Capture {
             records,
         })
     }
+
+    /// The SUMM cadence this container carries, decoded to a typed
+    /// [`o1host::Summary`] — so a consumer takes `gap_min`, the histogram and the
+    /// located exceptions as numbers, never re-parsing the text digest itself.
+    ///
+    /// `None` if the container carries no SUMM digest (a non-O1 capture, or a
+    /// reserved version-0 region) — never a guess.
+    ///
+    /// LOSSY BY THE CONTAINER'S DESIGN, and the loss is named: the digest line
+    /// carries `gap_min`, `gap_max`, `write_count`, `nonseq_count`, `threshold`,
+    /// `exc_count`, `exc_dropped` and the histogram EXACTLY, and the located
+    /// exceptions ride the native records — but it does NOT carry
+    /// `first_addr`/`last_addr` or an exact `gap_sum` (those exist only in a live
+    /// region drain, `drain 1`). Those three are filled best-effort here —
+    /// `first_addr`/`last_addr` = 0, `gap_sum` derived from the printed mean — and
+    /// MUST NOT be read as measured. A byte-perfect accessor wants the raw SUMM
+    /// words in the container: a format question left for the seam.
+    pub fn summary_decoded(&self) -> Option<o1host::Summary> {
+        let line = self.summary.as_deref()?;
+        // the first run of ASCII digits following `key=`
+        let field_u32 = |key: &str| -> Option<u32> {
+            line.split(key)
+                .nth(1)?
+                .trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|s| !s.is_empty())?
+                .parse()
+                .ok()
+        };
+        let write_count = field_u32("writes=")?;
+        let gap_min = field_u32("gap_min=")?;
+        let gap_max = field_u32("gap_max=")?;
+        let nonseq_count = field_u32("nonseq=")?;
+        let threshold = field_u32("threshold=")?;
+        let exc_count = field_u32("exc=")?;
+        let exc_dropped = field_u32("exc_dropped=")?;
+        // gap_mean carries a decimal point; gap_sum is DERIVED from it (lossy).
+        let gap_mean: f64 = line
+            .split("gap_mean=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        let gap_sum = (gap_mean * f64::from(write_count)).round() as u64;
+        // histogram: `hist=[b:c,b:c,…]`, bucket index -> count.
+        let mut histogram = vec![0u32; 256];
+        let inner = line.split("hist=[").nth(1)?.split(']').next()?;
+        for pair in inner.split(',').filter(|p| !p.is_empty()) {
+            let (b, c) = pair.split_once(':')?;
+            let b: usize = b.trim().parse().ok()?;
+            let c: u32 = c.trim().parse().ok()?;
+            if b < histogram.len() {
+                histogram[b] = c;
+            }
+        }
+        // the located exceptions ride the native records under the schema's
+        // `exception` tag — decoded through the container's own schema, no magic
+        // number and no O1-specific parse here.
+        let exc_tag = self.schema.records.iter().find(|r| r.name == "exception").map(|r| r.tag);
+        let mut exceptions = Vec::new();
+        if let Some(tag) = exc_tag {
+            for raw in self.records.iter().filter(|r| r.tag == tag) {
+                let Ok(rec) = lucid_trace::decode_record(&self.schema, raw) else {
+                    continue;
+                };
+                let field = |name: &str| -> Option<u32> {
+                    match rec.get(name)? {
+                        lucid_trace::FieldValue::U(x)
+                        | lucid_trace::FieldValue::Hex(x)
+                        | lucid_trace::FieldValue::Enum(x) => u32::try_from(*x).ok(),
+                        _ => None,
+                    }
+                };
+                if let (Some(gap), Some(addr), Some(write_ordinal), Some(seq)) = (
+                    field("gap"),
+                    field("addr"),
+                    field("write_ordinal"),
+                    field("seq"),
+                ) {
+                    exceptions.push(o1host::Exception { gap, addr, write_ordinal, seq });
+                }
+            }
+        }
+        Some(o1host::Summary {
+            version: 1,
+            gap_min,
+            gap_max,
+            gap_sum,
+            write_count,
+            first_addr: 0, // not carried by the container digest (see doc)
+            last_addr: 0,  // not carried by the container digest (see doc)
+            nonseq_count,
+            threshold,
+            exc_count,
+            exc_dropped,
+            histogram,
+            exceptions,
+        })
+    }
 }
 
 /// Read one `\n`-terminated line as UTF-8, advancing `pos` past it. `None` at

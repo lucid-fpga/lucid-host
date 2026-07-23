@@ -431,3 +431,48 @@ fn provenance_is_derived_and_names_the_dep_stack() {
         assert!(names.contains(&want), "dep stack names {want}: {}", p.deps);
     }
 }
+
+#[test]
+fn summary_decoded_returns_the_typed_cadence_and_none_without_summ() {
+    // POSITIVE: a SUMM-carrying container decodes to a typed o1host::Summary, so a
+    // consumer reads gap_min / histogram / exceptions as numbers with no text
+    // parse of its own — the values match the region the digest was rendered from.
+    let (schema, mut records) = O1Decoder
+        .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
+        .expect("RING converts");
+    let (_s, mut exc) = O1Decoder
+        .to_records(o1host::REGION_SUMM, &sample_summ(), &GOLDEN_HEAD)
+        .expect("SUMM converts");
+    records.append(&mut exc);
+    let summary = O1Decoder.summary(o1host::REGION_SUMM, &sample_summ());
+    let cap = Capture::new(
+        RunMode::Sim, 0x0001, 1, 1, 74_250_000, None,
+        O1Decoder.header_summary(&GOLDEN_HEAD), summary, schema, records,
+    );
+    let back = Capture::read(&cap.to_bytes()).expect("round-trips");
+
+    let s = back.summary_decoded().expect("a SUMM-carrying container decodes typed");
+    assert_eq!(s.gap_min, 40, "gap_min is exact from the digest");
+    assert_eq!(s.gap_max, 1_521_000, "gap_max is exact");
+    assert_eq!(s.write_count, 8, "write_count is exact");
+    assert_eq!(s.nonseq_count, 0);
+    assert_eq!(s.threshold, 1024);
+    assert_eq!((s.exc_count, s.exc_dropped), (2, 0), "exception counts are exact");
+    assert_eq!(s.histogram.len(), 256, "the full 256-bucket histogram is present");
+    assert_eq!((s.histogram[100], s.histogram[180]), (5, 1), "the nonzero buckets decode to their counts");
+    assert_eq!(s.gap_sum, 8192, "gap_sum derived from the printed mean (8192/8 = 1024.0, exact here)");
+    // the located exceptions come back typed, from the native records
+    assert_eq!(s.exceptions.len(), 2, "both located exceptions decode");
+    assert_eq!((s.exceptions[0].gap, s.exceptions[0].addr), (1_521_000, 0x0040_0000), "the stall, located");
+    assert_eq!((s.exceptions[1].gap, s.exceptions[1].addr), (2048, 0x0040_0004));
+    // the two fields the container digest does NOT carry are 0, never a fabricated
+    // measurement (documented lossiness).
+    assert_eq!((s.first_addr, s.last_addr), (0, 0), "un-carried fields are 0, not a guess");
+
+    // NEGATIVE: a capture with no SUMM digest yields None, never a guess.
+    let bare = Capture::new(
+        RunMode::Sim, 0x0001, 1, 1, 74_250_000, None,
+        None, None, back.schema.clone(), vec![],
+    );
+    assert!(bare.summary_decoded().is_none(), "no SUMM digest -> None, not a fabricated Summary");
+}

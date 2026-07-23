@@ -8,6 +8,7 @@
 //! The extension story and the honest scope are in `README.md` and `PARITY.md`.
 #![forbid(unsafe_code)]
 
+pub mod boot;
 pub mod capture;
 pub mod decoder;
 pub mod diff;

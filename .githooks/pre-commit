@@ -1,0 +1,49 @@
+#!/bin/sh
+# blaster2 pre-commit: leakage guard + the gate (project rule 1).
+set -e
+
+# Leakage guard (enforcement-as-code): block staged additions that match any
+# pattern in a repo-root `.leakguard` file (one extended-regex per line; blank
+# and '#' lines ignored). The pattern list is maintained outside this public
+# repo and copied into each clone; absent the file, the guard is a deliberate
+# silent no-op. Only ADDED lines are inspected.
+if [ -f .leakguard ]; then
+  # Two matching passes (marker convention: see the canonical
+  # runbook/leakguard-patterns):
+  #   default lines -> case-INsensitive: wordy / path / secret guards (any casing).
+  #   'CS ' lines   -> case-SENSITIVE:   brief-ids (uppercase B only), so lowercase
+  #                    b-binary literals (VCD b00000000, Verilog 1'b01) never match.
+  ci=$(grep -vE '^[[:space:]]*($|#)' .leakguard | grep -vE '^CS ' | paste -sd '|' -)
+  cs=$(grep -E '^CS ' .leakguard | sed 's/^CS //' | paste -sd '|' -)
+  added=$(git diff --cached --diff-filter=ACM -- . ':(exclude).leakguard' | grep -E '^\+' || true)
+  leak=""
+  if [ -n "$ci" ]; then
+    hit=$(printf '%s\n' "$added" | grep -inE "$ci" || true)
+    if [ -n "$hit" ]; then leak="$hit"; fi
+  fi
+  if [ -n "$cs" ]; then
+    hit=$(printf '%s\n' "$added" | grep -nE "$cs" || true)
+    if [ -n "$hit" ]; then leak="$leak
+$hit"; fi
+  fi
+  if [ -n "$leak" ]; then
+    echo "[leakage] BLOCKED — staged content matches a guarded pattern:"
+    echo "$leak"
+    echo "[leakage] scrub it, or if a false positive, commit by an excluded path."
+    exit 1
+  fi
+  echo "[leakage] clean"
+else
+  echo "[leakage] no pattern file present — guard skipped"
+fi
+
+# The gate: nothing commits unless build + test + clippy are green with default
+# features. Hardware-in-the-loop tests are behind the `hardware` feature and
+# deliberately excluded so the gate never needs a cable.
+echo "[gate] cargo build"
+cargo build --quiet
+echo "[gate] cargo test"
+cargo test --quiet
+echo "[gate] cargo clippy -- -D warnings"
+cargo clippy --quiet --all-targets -- -D warnings
+echo "[gate] green"

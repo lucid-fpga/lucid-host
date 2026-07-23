@@ -1,0 +1,41 @@
+#!/bin/sh
+# post-commit: record that THIS crate's gate passed — per-crate, derived.
+#
+# The pre-commit gate already ran green (a commit exists only if it did), so
+# this records the just-made commit into a PER-CRATE marker file. Each crate
+# writes its own file, so one crate's commit never overwrites another's status.
+# The destination is the STATE marker directory, configured per clone by an
+# untracked `.gate-marker` (one line: that directory's path). Absent it — or if
+# it does not name a directory — this is a silent no-op, so an un-opted or
+# freshly cloned machine is undisturbed and a stale path fails closed instead
+# of clobbering a shared file. No private path lives in this committed hook.
+[ -f .gate-marker ] || exit 0
+dir=$(head -n1 .gate-marker)
+[ -n "$dir" ] && [ -d "$dir" ] || exit 0
+crate=$(basename "$(git rev-parse --show-toplevel)")
+[ -n "$crate" ] || exit 0
+marker="$dir/gate-$crate.json"
+command -v python3 >/dev/null 2>&1 || exit 0
+
+commit=$(git rev-parse HEAD)
+case "$(uname -s)" in
+  Darwin*) machine=mac ;;
+  Linux*)  machine=linux ;;
+  *)       machine=other ;;
+esac
+date=$(date +%F)
+
+python3 - "$marker" "$crate" "$commit" "$machine" "$date" <<'PY' || exit 0
+import json, sys
+path, crate, commit, machine, date = sys.argv[1:6]
+data = {
+    "crate": crate,
+    "status": "pass",
+    "commit": commit[:7],
+    "machine": machine,
+    "date": date,
+}
+with open(path, "w") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY

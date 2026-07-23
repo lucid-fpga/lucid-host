@@ -1,0 +1,43 @@
+[workspace]
+
+[package]
+name = "lucid-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Bench host for LUCID instrument nodes: attach over any Tap, identify, drive, drain, and render evidence."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lucid-fpga/lucid-host"
+readme = "README.md"
+keywords = ["jtag", "fpga", "instrument", "bench", "capture"]
+categories = ["hardware-support", "embedded", "command-line-utilities"]
+
+[features]
+# Hardware-in-the-loop tests that open a physical cable. Off by default so the
+# build/test/clippy gate never depends on a cable being present. CableTap itself
+# is always compiled (from lucid-sld's `blaster2` feature) — only tests that
+# actually open() a cable are gated here.
+hardware = []
+
+[dependencies]
+# The transport seam + SLD hub walk + LIN instrument client. `blaster2` pulls in
+# CableTap (the real-cable Tap) — building it needs no cable, only running it.
+lucid-sld = { git = "https://github.com/lucid-fpga/lucid-sld", branch = "main", features = ["blaster2"] }
+# The USB-Blaster II driver: opening the cable and the read-only doctor.
+blaster2 = { git = "https://github.com/lucid-fpga/blaster2", branch = "main" }
+# The O1 instrument decoder — its one authoritative place (HGT3). Registered
+# through the decoder interface; the host never re-decodes O1 itself.
+o1host = { git = "https://github.com/lucid-fpga/lucid-probe-cores", branch = "main" }
+# The capture container's record/schema types (HGT6; GT6 preserved).
+lucid-trace = { git = "https://github.com/lucid-fpga/lucid-trace", branch = "main", default-features = false }
+thiserror = "2"
+
+# For local development against sibling clones, uncomment (never commit uncommented):
+# [patch."https://github.com/lucid-fpga/lucid-sld"]
+# lucid-sld = { path = "../lucid-sld" }
+# [patch."https://github.com/lucid-fpga/blaster2"]
+# blaster2 = { path = "../blaster2" }
+# [patch."https://github.com/lucid-fpga/lucid-probe-cores"]
+# o1host = { path = "../lucid-probe-cores/tools/o1host" }
+# [patch."https://github.com/lucid-fpga/lucid-trace"]
+# lucid-trace = { path = "../lucid-trace" }

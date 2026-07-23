@@ -300,6 +300,32 @@ fn filter_is_three_writes_and_policy_encodes_stop_vs_wrap() {
 }
 
 #[test]
+fn threshold_is_one_write_with_ticks_in_the_payload_and_is_idempotent() {
+    // THRESH is a config latch that survives CLEAR: ONE CTRL word, bit 13 set,
+    // the tick count carried in the payload (CTRL[63:32]). The host's job is the
+    // correct word; the fabric-level "log only the outlier vs overflow at 1024"
+    // is the sim crate's re-witness (both directions).
+    let (w0, n0) = O1Decoder.ctrl_words(&Ctrl::Threshold(1_000_000), false).unwrap();
+    let (w1, _n1) = O1Decoder.ctrl_words(&Ctrl::Threshold(1_000_000), n0).unwrap();
+    let thresh = 1u64 << o1host::ctrl_bit::THRESH;
+    let nonce = 1u64 << o1host::ctrl_bit::NONCE;
+    assert_eq!(w0.len(), 1, "threshold is a single CTRL write");
+    assert!(w0[0] & thresh != 0, "the THRESH bit is set");
+    assert_eq!(
+        w0[0] >> o1host::ctrl_bit::PAYLOAD_LSB,
+        1_000_000,
+        "the tick count rides the payload (CTRL[63:32])"
+    );
+    // both directions encode their own value, no clamping: the raised ~1M and the
+    // default 1024 each land verbatim.
+    let (dflt, _) = O1Decoder.ctrl_words(&Ctrl::Threshold(1024), false).unwrap();
+    assert_eq!(dflt[0] >> o1host::ctrl_bit::PAYLOAD_LSB, 1024, "default 1024 encodes verbatim");
+    // idempotent at the host level: a repeated identical set still toggles the
+    // nonce so the fabric sees a fresh edge.
+    assert_ne!(w0[0] & nonce, w1[0] & nonce, "a repeated set toggles the nonce edge");
+}
+
+#[test]
 fn an_instrument_with_no_decoder_refuses_ctrl() {
     // the trait default: no CTRL surface -> Refused
     struct Bare;

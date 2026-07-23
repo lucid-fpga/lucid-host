@@ -110,6 +110,15 @@ pub fn o1_summary(s: &o1host::Summary) -> String {
         "core cadence: writes={} gap[min/mean/max]={}/{:.1}/{} ticks nonseq={} threshold={}",
         s.write_count, s.gap_min, s.gap_mean(), s.gap_max, s.nonseq_count, s.threshold
     );
+    // The aggregate is over ALL observed writes — SUMM is ungated by the filter
+    // (independent of the ring WINDOW by construction), so mean/max include the
+    // boot-mailbox idle gaps and are NOT delivery figures. The delivery cadence
+    // lives in the histogram and the located exceptions below. `gap_min` is safe
+    // to read as the native rate (the smallest gap is always a payload gap).
+    out.push_str(
+        "\n  (min/mean/max span ALL observed writes, incl. boot-mailbox idle — for the \
+         delivery cadence read the histogram + exceptions below, not mean/max)",
+    );
     out.push_str(&format!(
         "\n  addr span: 0x{:08X} -> 0x{:08X}",
         s.first_addr, s.last_addr

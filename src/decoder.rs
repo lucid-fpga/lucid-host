@@ -123,6 +123,12 @@ pub enum Ctrl {
         /// Inclusive high address bound.
         addr_hi: u32,
     },
+    /// Set the summariser's exception threshold, in clk ticks: an inter-write
+    /// gap at or above this is LOCATED in the exception log. Config, not capture
+    /// state — the fabric latches it, so it survives CLEAR. Raising it above the
+    /// recurring small stalls keeps the bounded exception log from overflowing,
+    /// so the single largest gap is retained with its byte offset.
+    Threshold(u32),
 }
 
 /// One instrument's decode+render+control, owned by whoever owns that
@@ -298,6 +304,8 @@ impl Decoder for O1Decoder {
                 c.build(&[cb::FILT_LO], *addr_lo),
                 c.build(&[cb::FILT_HI], *addr_hi),
             ],
+            // THRESH (bit 13) with the tick count in the payload (CTRL[63:32]).
+            Ctrl::Threshold(ticks) => vec![c.build(&[cb::THRESH], *ticks)],
         };
         Ok((words, c.nonce))
     }

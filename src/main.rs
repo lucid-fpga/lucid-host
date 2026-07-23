@@ -37,6 +37,7 @@ fn usage() -> String {
          \x20 clear               clear the ring, counters, and sticky flags\n\
          \x20 filter <mask> <lo> <hi>   set the event filter (hex)\n\
          \x20 policy <stop|wrap>  set the overflow policy\n\
+         \x20 threshold <ticks>  set the SUMM exception threshold (dec or 0xhex)\n\
          \n\
          FILE commands (no cable):\n\
          \x20 show <file>         read a capture container and render it\n\
@@ -85,7 +86,7 @@ fn run(args: &[String]) -> Result<(), HostError> {
         }
         // read-only + CTRL + capture all touch the cable
         "doctor" | "enumerate" | "ident" | "head" | "status" | "drain" | "capture" | "arm"
-        | "disarm" | "clear" | "filter" | "policy" => run_device(cmd, args),
+        | "disarm" | "clear" | "filter" | "policy" | "threshold" => run_device(cmd, args),
         // file commands need no cable
         "show" => run_show(args),
         "diff" => run_diff(args),
@@ -104,6 +105,15 @@ fn arg<'a>(args: &'a [String], i: usize, what: &str) -> Result<&'a str, HostErro
 fn parse_hex(s: &str, what: &str) -> Result<u32, HostError> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16)
         .map_err(|_| HostError::Usage(format!("{what} must be hex")))
+}
+
+/// Parse a u32 written either as decimal or as `0x`-prefixed hex.
+fn parse_u32(s: &str, what: &str) -> Result<u32, HostError> {
+    let parsed = match s.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => s.parse::<u32>(),
+    };
+    parsed.map_err(|_| HostError::Usage(format!("{what} must be a u32 (decimal or 0xhex)")))
 }
 
 /// Open the real cable and run a device command. The cable is only touched here,
@@ -207,6 +217,12 @@ fn run_device(cmd: &str, args: &[String]) -> Result<(), HostError> {
                 false,
             )?;
             println!("filter: set");
+        }
+        "threshold" => {
+            let d = decoder.ok_or_else(|| HostError::Refused("no decoder for CTRL".into()))?;
+            let ticks = parse_u32(arg(args, 1, "ticks")?, "ticks")?;
+            host::apply_ctrl(&mut tap, &a.node, d, &Ctrl::Threshold(ticks), false)?;
+            println!("threshold: set to {ticks} ticks");
         }
         _ => unreachable!("run_device only called for device commands"),
     }

@@ -226,10 +226,15 @@ fn run_show(args: &[String]) -> Result<(), HostError> {
     if let Some(h) = &cap.header_summary {
         println!("header: {h}");
     }
+    if let Some(s) = &cap.summary {
+        println!("summary: {s}");
+    }
     println!("events: {} native records", cap.records.len());
     // `show <file> events` decodes each native record through lucid-trace's own
     // decoder and prints its fields — the container's events, read the same way
-    // a downstream consumer would, with no O1-specific code here.
+    // a downstream consumer would, with no O1-specific code here. Two record
+    // kinds share the payload: ring `event`s and SUMM `exception`s (a located
+    // over-threshold gap); each is rendered from the fields its schema names.
     if args.iter().any(|a| a == "events") {
         for raw in &cap.records {
             match lucid_trace::decode_record(&cap.schema, raw) {
@@ -242,10 +247,18 @@ fn run_show(args: &[String]) -> Result<(), HostError> {
                             _ => 0,
                         }
                     };
-                    println!(
-                        "  t={:>10} kind={} addr=0x{:08X} data=0x{:08X} seq={}",
-                        rec.timestamp, f("kind"), f("addr") as u32, f("data") as u32, f("seq")
-                    );
+                    if rec.get("gap").is_some() {
+                        // a SUMM exception: the stall, LOCATED at its byte offset
+                        println!(
+                            "  exception gap={} @ 0x{:08X} write#{} seq={}",
+                            f("gap"), f("addr") as u32, f("write_ordinal"), f("seq")
+                        );
+                    } else {
+                        println!(
+                            "  t={:>10} kind={} addr=0x{:08X} data=0x{:08X} seq={}",
+                            rec.timestamp, f("kind"), f("addr") as u32, f("data") as u32, f("seq")
+                        );
+                    }
                 }
                 Err(e) => println!("  (record decode: {e})"),
             }

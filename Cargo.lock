@@ -139,7 +139,7 @@ dependencies = [
 [[package]]
 name = "o1host"
 version = "0.1.0"
-source = "git+https://github.com/lucid-fpga/lucid-probe-cores?branch=main#2f200fd1d02f1974d6d04be209f0f4dbec77314c"
+source = "git+https://github.com/lucid-fpga/lucid-probe-cores?branch=main#f4c4bac0783ba8fd6269a4277f5ea7cfea611b03"
 dependencies = [
  "lucid-sld",
 ]

@@ -11,39 +11,66 @@ use lucid_trace::{RawRecord, Schema};
 
 /// The O1 event record tag inside the native lucid-trace payload (4-bit).
 const O1_EVENT_TAG: u8 = 1;
+/// The O1 SUMM exception record tag — a located over-threshold gap. The
+/// exception log is CHNK-shaped in the fabric precisely so it carries here as a
+/// native record, re-decodable downstream with no O1-specific code (HGT6).
+const O1_EXCEPTION_TAG: u8 = 2;
 
-/// The O1 event schema — defined once, here in the O1 decoder, so an O1 capture
-/// carries a self-describing record layout and a downstream consumer decodes it
-/// with no O1-specific code. Fields pack an o1host `Event` into 96 payload bits.
-fn o1_event_schema(core_clock_hz: u32) -> Schema {
+/// The O1 capture schema — defined once, here in the O1 decoder, so an O1
+/// capture carries a self-describing record layout and a downstream consumer
+/// decodes it with no O1-specific code. It describes both record kinds a capture
+/// can hold: ring `event`s (96 payload bits) and SUMM `exception`s (128 bits).
+fn o1_schema(core_clock_hz: u32) -> Schema {
     let mut schema = Schema {
         format_version: lucid_trace::schema::FORMAT_VERSION,
         schema_version: 1,
         schema_hash: 0,
         core_clock_hz,
-        records: vec![RecordDef {
-            tag: O1_EVENT_TAG,
-            name: "event".into(),
-            fields: vec![
-                FieldDef { name: "addr".into(), offset: 0, width: 32, encoding: Encoding::Hex },
-                FieldDef { name: "data".into(), offset: 32, width: 32, encoding: Encoding::Hex },
-                FieldDef { name: "kind".into(), offset: 64, width: 4, encoding: Encoding::Enum },
-                FieldDef { name: "flags".into(), offset: 68, width: 8, encoding: Encoding::U },
-                FieldDef { name: "seq".into(), offset: 76, width: 20, encoding: Encoding::U },
-            ],
-        }],
+        records: vec![
+            RecordDef {
+                tag: O1_EVENT_TAG,
+                name: "event".into(),
+                fields: vec![
+                    FieldDef { name: "addr".into(), offset: 0, width: 32, encoding: Encoding::Hex },
+                    FieldDef { name: "data".into(), offset: 32, width: 32, encoding: Encoding::Hex },
+                    FieldDef { name: "kind".into(), offset: 64, width: 4, encoding: Encoding::Enum },
+                    FieldDef { name: "flags".into(), offset: 68, width: 8, encoding: Encoding::U },
+                    FieldDef { name: "seq".into(), offset: 76, width: 20, encoding: Encoding::U },
+                ],
+            },
+            RecordDef {
+                tag: O1_EXCEPTION_TAG,
+                name: "exception".into(),
+                fields: vec![
+                    FieldDef { name: "gap".into(), offset: 0, width: 32, encoding: Encoding::U },
+                    FieldDef { name: "addr".into(), offset: 32, width: 32, encoding: Encoding::Hex },
+                    FieldDef { name: "write_ordinal".into(), offset: 64, width: 32, encoding: Encoding::U },
+                    FieldDef { name: "seq".into(), offset: 96, width: 32, encoding: Encoding::U },
+                ],
+            },
+        ],
     };
     schema.schema_hash = schema.computed_hash();
     schema
 }
 
-/// Pack an o1host `Event` into the 96-bit payload the schema above describes.
+/// Pack an o1host `Event` into the 96-bit payload the event schema describes.
 fn pack_o1_event(e: &o1host::Event) -> u128 {
     (e.addr as u128)
         | ((e.data as u128) << 32)
         | ((u128::from(e.kind) & 0xF) << 64)
         | ((u128::from(e.flags)) << 68)
         | ((u128::from(e.seq) & 0xF_FFFF) << 76)
+}
+
+/// Pack an o1host SUMM `Exception` into the 128-bit payload the exception schema
+/// describes — the LOCATED stall: its gap, the byte offset it happened at, and
+/// the write/seq ordinals that pin it to a point in the stream.
+fn pack_o1_exception(e: &o1host::Exception) -> u128 {
+    (e.gap as u128)
+        | ((e.addr as u128) << 32)
+        | ((e.write_ordinal as u128) << 64)
+        | ((e.seq as u128) << 96)
 }
 
 /// The events that belong to THIS capture — `Header::valid_events`, authoritative
@@ -146,6 +173,15 @@ pub trait Decoder {
         None
     }
 
+    /// A one-line digest of a summary/aggregate region (e.g. O1's SUMM
+    /// cadence) for the capture container's text header — the aggregate facts a
+    /// reader wants at a glance, diffable field-by-field. The region's per-item
+    /// detail (located exceptions) rides the payload as native records; this is
+    /// the scalar overview. Default: none.
+    fn summary(&self, _region: u8, _words: &[u32]) -> Option<String> {
+        None
+    }
+
     /// Convert a data region's words into NATIVE lucid-trace records plus the
     /// schema describing them — the capture container's payload (HGT6). This is
     /// where the instrument's event packing meets the suite's record format, so
@@ -189,6 +225,14 @@ impl Decoder for O1Decoder {
     }
 
     fn render_region(&self, region: u8, words: &[u32], header_words: &[u32]) -> String {
+        if region == o1host::REGION_SUMM {
+            // The summariser names its own malformation rather than rendering a
+            // guess; a version-0 (reserved) block says so plainly.
+            return match o1host::Summary::decode(words) {
+                Ok(s) => render::o1_summary(&s),
+                Err(e) => format!("[region {region}] SUMM undecoded: {e}"),
+            };
+        }
         if region != o1host::REGION_RING {
             return render::raw_region(region, words);
         }
@@ -264,24 +308,54 @@ impl Decoder for O1Decoder {
         words: &[u32],
         header_words: &[u32],
     ) -> Option<(Schema, Vec<RawRecord>)> {
-        if region != o1host::REGION_RING {
+        // core_clock_hz is not in the region words; the container header carries
+        // the timestamp domain, and the schema's copy is filled by the writer.
+        let schema = o1_schema(0);
+        match region {
+            r if r == o1host::REGION_RING => {
+                // only THIS capture's valid events — the container never banks
+                // stale ring words a CLEAR left behind (the fix, in one place).
+                let raws = valid_ring_events(words, header_words)
+                    .iter()
+                    .map(|e| RawRecord {
+                        tag: O1_EVENT_TAG,
+                        timestamp: e.timestamp,
+                        payload: pack_o1_event(e),
+                        payload_bits: 96,
+                    })
+                    .collect();
+                Some((schema, raws))
+            }
+            r if r == o1host::REGION_SUMM => {
+                // The located over-threshold gaps. The exception log has no
+                // absolute tick (it stores gap + seq), so timestamp is 0 — the
+                // payload carries what LOCATES the stall (gap, addr, ordinal,
+                // seq). A version-0 or malformed block yields no records.
+                let s = o1host::Summary::decode(words).ok()?;
+                if s.exceptions.is_empty() {
+                    return None;
+                }
+                let raws = s
+                    .exceptions
+                    .iter()
+                    .map(|e| RawRecord {
+                        tag: O1_EXCEPTION_TAG,
+                        timestamp: 0,
+                        payload: pack_o1_exception(e),
+                        payload_bits: 128,
+                    })
+                    .collect();
+                Some((schema, raws))
+            }
+            _ => None,
+        }
+    }
+
+    fn summary(&self, region: u8, words: &[u32]) -> Option<String> {
+        if region != o1host::REGION_SUMM {
             return None;
         }
-        // core_clock_hz is not in the ring words; the container header carries
-        // the timestamp domain, and the schema's copy is filled by the writer.
-        let schema = o1_event_schema(0);
-        // only THIS capture's valid events — the container never banks stale
-        // ring words a CLEAR left behind (the fix, in one place).
-        let raws = valid_ring_events(words, header_words)
-            .iter()
-            .map(|e| RawRecord {
-                tag: O1_EVENT_TAG,
-                timestamp: e.timestamp,
-                payload: pack_o1_event(e),
-                payload_bits: 96,
-            })
-            .collect();
-        Some((schema, raws))
+        o1host::Summary::decode(words).ok().map(|s| render::o1_summary_line(&s))
     }
 }
 

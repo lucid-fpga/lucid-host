@@ -81,6 +81,98 @@ pub fn o1_header(h: &o1host::Header) -> String {
     )
 }
 
+/// The lower gap bound (ticks) a log2 histogram bucket represents. Buckets are
+/// `{leading_one_position[4:0], three_mantissa_bits}` (FIELD-MAP §Histogram):
+/// bucket 0 is a zero (or single-tick) gap; otherwise the leading one sits at
+/// `b>>3` and the next three bits refine it, so a real gap resolves to within
+/// `2^(lead-3)` ticks. Rendered as a lower bound so the distribution the mean
+/// hides is legible without pretending to more precision than the encoding has.
+pub fn hist_bucket_gap_lo(b: usize) -> u64 {
+    if b == 0 {
+        return 0;
+    }
+    let lead = (b >> 3) as u32;
+    let mant = (b & 0x7) as u64;
+    let base = 1u64 << lead;
+    if lead >= 3 {
+        base + mant * (1u64 << (lead - 3))
+    } else {
+        base
+    }
+}
+
+/// The full O1 SUMM cadence render (min/mean/max, the histogram, and the
+/// exception log with every over-threshold gap LOCATED at its byte offset).
+/// This is the live `drain 1` view; the capture container carries the same
+/// facts as a digest line plus the exceptions as native records.
+pub fn o1_summary(s: &o1host::Summary) -> String {
+    let mut out = format!(
+        "core cadence: writes={} gap[min/mean/max]={}/{:.1}/{} ticks nonseq={} threshold={}",
+        s.write_count, s.gap_min, s.gap_mean(), s.gap_max, s.nonseq_count, s.threshold
+    );
+    out.push_str(&format!(
+        "\n  addr span: 0x{:08X} -> 0x{:08X}",
+        s.first_addr, s.last_addr
+    ));
+
+    let nonzero: Vec<(usize, u32)> = s
+        .histogram
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c != 0)
+        .map(|(b, &c)| (b, c))
+        .collect();
+    out.push_str(&format!(
+        "\n  histogram (log2 buckets, {} of {} nonzero):",
+        nonzero.len(),
+        s.histogram.len()
+    ));
+    for (b, c) in &nonzero {
+        out.push_str(&format!(
+            "\n    bucket {b:>3} (>= {:>10} ticks): {c}",
+            hist_bucket_gap_lo(*b)
+        ));
+    }
+
+    out.push_str(&format!(
+        "\n  exceptions: {} logged, {} dropped",
+        s.exc_count, s.exc_dropped
+    ));
+    for (i, e) in s.exceptions.iter().enumerate() {
+        out.push_str(&format!(
+            "\n    #{i} gap={} @ 0x{:08X}  (write #{}, seq {})",
+            e.gap, e.addr, e.write_ordinal, e.seq
+        ));
+    }
+    out
+}
+
+/// A one-line SUMM digest for the capture container header — the aggregate
+/// scalars plus the nonzero histogram buckets, so the container carries the
+/// distribution and the cadence in a diffable line (D10). The located
+/// exceptions ride the payload as native records, not this line.
+pub fn o1_summary_line(s: &o1host::Summary) -> String {
+    let hist: Vec<String> = s
+        .histogram
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c != 0)
+        .map(|(b, &c)| format!("{b}:{c}"))
+        .collect();
+    format!(
+        "writes={} gap_min={} gap_mean={:.1} gap_max={} nonseq={} threshold={} exc={} exc_dropped={} hist=[{}]",
+        s.write_count,
+        s.gap_min,
+        s.gap_mean(),
+        s.gap_max,
+        s.nonseq_count,
+        s.threshold,
+        s.exc_count,
+        s.exc_dropped,
+        hist.join(",")
+    )
+}
+
 /// RAW render for an unidentified instrument or an undecoded region: the
 /// literal word UNDECODED, the header hex, and byte-faithful words — never a
 /// guess about an instrument the host cannot identify.

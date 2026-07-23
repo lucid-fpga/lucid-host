@@ -45,12 +45,47 @@ fn head_with_count(n: u32) -> [u32; 16] {
     h
 }
 
+/// A well-formed SUMM region: aggregate + a couple of histogram hits + two
+/// LOCATED exceptions (the first is a large stall at byte offset 0x00400000).
+fn sample_summ() -> Vec<u32> {
+    use o1host::summ;
+    let mut w = vec![0u32; summ::AGG_WORDS + summ::HIST_BUCKETS + 2 * summ::EXC_WORDS];
+    w[summ::MAGIC] = o1host::MAGIC_SUMM;
+    w[summ::MAGIC2] = o1host::MAGIC_SUMM2;
+    w[summ::SUMMARY_VERSION] = 1;
+    w[summ::GAP_MIN] = 40;
+    w[summ::GAP_MAX] = 1_521_000; // a large stall, in ticks
+    w[summ::GAP_SUM_LO] = 0x0000_2000;
+    w[summ::WRITE_COUNT] = 8;
+    w[summ::FIRST_ADDR] = 0x0000_0000;
+    w[summ::LAST_ADDR] = 0x0000_001C;
+    w[summ::NONSEQ_COUNT] = 0;
+    w[summ::THRESHOLD] = 1024;
+    w[summ::EXC_COUNT] = 2;
+    w[summ::EXC_DROPPED] = 0;
+    w[summ::HIST_BUCKET_COUNT] = summ::HIST_BUCKETS as u32;
+    w[summ::EXC_CAPACITY] = summ::EXC_ENTRIES as u32;
+    w[summ::AGG_WORDS + 100] = 5; // two nonzero histogram buckets
+    w[summ::AGG_WORDS + 180] = 1;
+    let e0 = summ::AGG_WORDS + summ::HIST_BUCKETS;
+    w[e0 + summ::E_GAP] = 1_521_000;
+    w[e0 + summ::E_ADDR] = 0x0040_0000; // LOCATED here
+    w[e0 + summ::E_ORDINAL] = 6;
+    w[e0 + summ::E_SEQ] = 6;
+    let e1 = e0 + summ::EXC_WORDS;
+    w[e1 + summ::E_GAP] = 2048;
+    w[e1 + summ::E_ADDR] = 0x0040_0004;
+    w[e1 + summ::E_ORDINAL] = 7;
+    w[e1 + summ::E_SEQ] = 7;
+    w
+}
+
 fn sample_capture() -> Capture {
     let (schema, records) = O1Decoder
         .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
         .expect("O1 RING converts to native records");
     let header = O1Decoder.header_summary(&GOLDEN_HEAD);
-    Capture::new(RunMode::Sim, 0x0001, 1, 1, 74_250_000, None, header, schema, records)
+    Capture::new(RunMode::Sim, 0x0001, 1, 1, 74_250_000, None, header, None, schema, records)
 }
 
 // ---- the fix: only THIS capture's valid events, never stale ring words ----
@@ -94,6 +129,76 @@ fn a_fresh_ring_capture_is_unaffected_by_the_fix() {
         .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
         .expect("RING converts");
     assert_eq!(records.len(), 2, "a fresh-ring count is unchanged by the fix");
+}
+
+// ---- SUMM: the cadence renders, and every stall is LOCATED and carried ----
+
+#[test]
+fn the_summ_region_renders_min_mean_max_and_locates_each_exception() {
+    let r = O1Decoder.render_region(o1host::REGION_SUMM, &sample_summ(), &GOLDEN_HEAD);
+    assert!(r.contains("writes=8"), "the render states the write count: {r}");
+    assert!(r.contains("gap[min/mean/max]"), "min/mean/max are rendered: {r}");
+    assert!(r.contains("histogram"), "the histogram the mean hides is rendered: {r}");
+    // the load-bearing fact: the stall is LOCATED at its byte offset in the render
+    assert!(r.contains("0x00400000"), "the exception is LOCATED at its offset: {r}");
+    assert!(r.contains("exceptions: 2 logged"), "both exceptions are shown: {r}");
+}
+
+#[test]
+fn summ_exceptions_convert_to_native_records_at_their_offsets() {
+    let (schema, recs) = O1Decoder
+        .to_records(o1host::REGION_SUMM, &sample_summ(), &GOLDEN_HEAD)
+        .expect("a SUMM with exceptions yields native records");
+    assert_eq!(recs.len(), 2, "one native record per logged exception");
+    assert!(recs.iter().all(|r| r.tag == 2), "an exception record is tag 2, not a ring event");
+    // the located byte offset survives into the payload (addr at bits [32..64])
+    assert_eq!((recs[0].payload >> 32) as u32, 0x0040_0000, "the stall's byte offset is in the record");
+    // and it decodes back through lucid-trace with no O1-specific code (HGT6)
+    let rec = lucid_trace::decode_record(&schema, &recs[0]).expect("native decode");
+    assert!(rec.get("gap").is_some(), "the exception record names its gap downstream");
+}
+
+#[test]
+fn a_reserved_summ_region_yields_no_records_and_names_itself() {
+    // summary_version 0 is the RESERVED, not-implemented state — the decoder must
+    // not manufacture a cadence from it, and must say so rather than guess.
+    let mut w = sample_summ();
+    w[o1host::summ::SUMMARY_VERSION] = 0;
+    assert!(
+        O1Decoder.to_records(o1host::REGION_SUMM, &w, &GOLDEN_HEAD).is_none(),
+        "a reserved SUMM contributes no records"
+    );
+    let r = O1Decoder.render_region(o1host::REGION_SUMM, &w, &GOLDEN_HEAD);
+    assert!(r.contains("undecoded"), "a reserved block names itself, not a guess: {r}");
+}
+
+#[test]
+fn a_capture_carries_the_summ_digest_and_every_exception_round_trips() {
+    // Built the way host::capture composes it: ring events AND the SUMM located
+    // exceptions in ONE native payload, plus the SUMM digest in the header.
+    let (schema, mut records) = O1Decoder
+        .to_records(o1host::REGION_RING, &sample_ring(), &head_with_count(2))
+        .expect("RING converts");
+    let (_s, mut exc) = O1Decoder
+        .to_records(o1host::REGION_SUMM, &sample_summ(), &GOLDEN_HEAD)
+        .expect("SUMM converts");
+    records.append(&mut exc);
+    let summary = O1Decoder.summary(o1host::REGION_SUMM, &sample_summ());
+    assert!(summary.is_some(), "the decoder digests the SUMM aggregate for the header");
+    let cap = Capture::new(
+        RunMode::Sim, 0x0001, 1, 1, 74_250_000, None,
+        O1Decoder.header_summary(&GOLDEN_HEAD), summary, schema, records,
+    );
+
+    let back = Capture::read(&cap.to_bytes()).expect("a SUMM-carrying capture round-trips");
+    assert_eq!(back.summary, cap.summary, "the SUMM digest survives the container");
+    assert!(back.summary.as_deref().unwrap().contains("writes=8"), "the digest carries the cadence");
+    assert_eq!(back.records.len(), 4, "2 ring events + 2 located exceptions");
+    assert_eq!(
+        back.records.iter().filter(|r| r.tag == 2).count(),
+        2,
+        "both located exceptions survive as native, re-decodable records"
+    );
 }
 
 // ---- refuse-before-use maps to typed errors that NAME the mismatch ----

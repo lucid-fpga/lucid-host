@@ -112,7 +112,14 @@ pub fn capture<T: Tap>(
     let head = drain_region(tap, node, decoder.header_region())?;
     let header_summary = decoder.header_summary(&head);
 
-    let mut payload = None;
+    // Every non-header region contributes: ring events AND the SUMM located
+    // exceptions land in ONE native payload (they share one self-describing
+    // schema, tagged per record kind), and a summary/aggregate region also
+    // yields its one-line digest for the container header. No region is
+    // skipped, so a capture carries all the instrument publishes.
+    let mut schema = None;
+    let mut records: Vec<lucid_trace::RawRecord> = Vec::new();
+    let mut summary = None;
     for r in 0..ident.region_count {
         if r == decoder.header_region() {
             continue;
@@ -120,12 +127,15 @@ pub fn capture<T: Tap>(
         let words = drain_region(tap, node, r)?;
         // pass the header so the decoder records only THIS capture's valid
         // events, never stale ring words a CLEAR left behind (the fix)
-        if let Some(sr) = decoder.to_records(r, &words, &head) {
-            payload = Some(sr);
-            break;
+        if let Some((s, mut recs)) = decoder.to_records(r, &words, &head) {
+            schema.get_or_insert(s);
+            records.append(&mut recs);
+        }
+        if summary.is_none() {
+            summary = decoder.summary(r, &words);
         }
     }
-    let (schema, records) = payload.ok_or_else(|| {
+    let schema = schema.ok_or_else(|| {
         HostError::Refused("instrument exposes no capturable record region".into())
     })?;
 
@@ -137,6 +147,7 @@ pub fn capture<T: Tap>(
         ident.core_clock_hz,
         seed,
         header_summary,
+        summary,
         schema,
         records,
     ))

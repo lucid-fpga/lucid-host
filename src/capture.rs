@@ -84,6 +84,11 @@ pub struct Capture {
     /// A one-line decoded summary of the instrument's header (core_rev, filter,
     /// overflow block) — decoder-provided, so it is not O1-specific here.
     pub header_summary: Option<String>,
+    /// A one-line decoded digest of the instrument's summary/aggregate region
+    /// (O1's SUMM cadence: min/mean/max, histogram) — decoder-provided, so the
+    /// container carries the aggregate without O1-specific code here. The
+    /// per-item detail (located exceptions) rides `records` as native records.
+    pub summary: Option<String>,
     /// The event schema (native lucid-trace).
     pub schema: Schema,
     /// The events, as native lucid-trace records.
@@ -102,6 +107,7 @@ impl Capture {
         core_clock_hz: u32,
         seed: Option<u32>,
         header_summary: Option<String>,
+        summary: Option<String>,
         schema: Schema,
         records: Vec<RawRecord>,
     ) -> Self {
@@ -117,6 +123,7 @@ impl Capture {
             core_clock_hz,
             seed,
             header_summary,
+            summary,
             schema,
             records,
         }
@@ -141,6 +148,9 @@ impl Capture {
         }
         if let Some(h) = &self.header_summary {
             writeln!(w, "instrument_header {h}")?;
+        }
+        if let Some(s) = &self.summary {
+            writeln!(w, "instrument_summary {s}")?;
         }
         // Stamp the timestamp domain into the schema so the payload is fully
         // self-describing, then dump natively.
@@ -192,6 +202,7 @@ impl Capture {
         let mut core_clock_hz = None;
         let mut seed = None;
         let mut header_summary = None;
+        let mut summary = None;
 
         let payload_len: usize = loop {
             let line = read_line(bytes, &mut pos)
@@ -221,6 +232,8 @@ impl Capture {
                         .ok()
                         .map(Some)
                 };
+            } else if let Some(v) = line.strip_prefix("instrument_summary ") {
+                summary = Some(v.to_string());
             } else if let Some(v) = line.strip_prefix("instrument_header ") {
                 header_summary = Some(v.to_string());
             }
@@ -254,6 +267,7 @@ impl Capture {
             core_clock_hz,
             seed: seed.flatten(),
             header_summary,
+            summary,
             schema,
             records,
         })

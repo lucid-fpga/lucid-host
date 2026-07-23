@@ -227,6 +227,30 @@ fn run_show(args: &[String]) -> Result<(), HostError> {
         println!("header: {h}");
     }
     println!("events: {} native records", cap.records.len());
+    // `show <file> events` decodes each native record through lucid-trace's own
+    // decoder and prints its fields — the container's events, read the same way
+    // a downstream consumer would, with no O1-specific code here.
+    if args.iter().any(|a| a == "events") {
+        for raw in &cap.records {
+            match lucid_trace::decode_record(&cap.schema, raw) {
+                Ok(rec) => {
+                    let f = |n: &str| -> u128 {
+                        match rec.get(n) {
+                            Some(lucid_trace::FieldValue::Hex(v))
+                            | Some(lucid_trace::FieldValue::U(v))
+                            | Some(lucid_trace::FieldValue::Enum(v)) => *v,
+                            _ => 0,
+                        }
+                    };
+                    println!(
+                        "  t={:>10} kind={} addr=0x{:08X} data=0x{:08X} seq={}",
+                        rec.timestamp, f("kind"), f("addr") as u32, f("data") as u32, f("seq")
+                    );
+                }
+                Err(e) => println!("  (record decode: {e})"),
+            }
+        }
+    }
     Ok(())
 }
 

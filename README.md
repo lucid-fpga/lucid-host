@@ -18,12 +18,15 @@ device renders `RAW` and the literal word `UNDECODED`, never a guess.
 
 ## The command surface
 
-Commands are split into two groups, and the split is visible in `--help`:
+Commands are grouped, and the grouping is visible in `--help`:
 
-- **Read-only** (`doctor`, `enumerate`, `ident`, `head`, `status`, `drain`) —
-  they only read the instrument, so a scripted battery can run them unattended.
+- **Read-only** (`doctor`, `enumerate`, `ident`, `head`, `status`, `drain`,
+  `capture`) — they only read the instrument, so a scripted battery can run them
+  unattended. `capture` drains to a versioned container file.
 - **CTRL** (`arm`, `disarm`, `clear`, `filter`, `policy`) — they write to the
   instrument and are meant to be run with care.
+- **File** (`show`, `diff`) — no cable: render a container, or diff two of them
+  (headers field-by-field and the first event divergence located).
 
 Every command prints a provenance banner: the tool's own revision and dirty
 state, and the exact revision of each composed crate — all derived at build

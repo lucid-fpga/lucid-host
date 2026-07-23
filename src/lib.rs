@@ -10,6 +10,7 @@
 
 pub mod capture;
 pub mod decoder;
+pub mod diff;
 pub mod error;
 pub mod host;
 pub mod provenance;

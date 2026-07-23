@@ -2,7 +2,9 @@
 //! so the same flow serves a real cable and a simulated one. Every boundary
 //! refuses before use.
 
-use crate::error::Result;
+use crate::capture::{Capture, RunMode};
+use crate::decoder::{Ctrl, Decoder};
+use crate::error::{HostError, Result};
 use lucid_sld::enumerate::{enumerate, Enumeration};
 use lucid_sld::instrument::{self as lin, Ident, RegionInfo};
 use lucid_sld::node::Node;
@@ -51,4 +53,89 @@ pub fn drain_region<T: Tap>(tap: &mut T, node: &Node, region: u8) -> Result<Vec<
     let mut words = lin::split64(&raw);
     words.truncate(ri.word_count as usize);
     Ok(words)
+}
+
+/// The instrument's raw STATUS chunks.
+pub fn status_chunks<T: Tap>(tap: &mut T, node: &Node) -> Result<Vec<u64>> {
+    Ok(lin::status_chunks(tap, node)?)
+}
+
+/// Apply a CTRL action through the instrument's decoder, writing its word(s) in
+/// order. Returns the nonce to carry into the next write (so a caller doing
+/// several writes keeps producing edges — CTRL is level-latched).
+pub fn apply_ctrl<T: Tap>(
+    tap: &mut T,
+    node: &Node,
+    decoder: &dyn Decoder,
+    action: &Ctrl,
+    nonce: bool,
+) -> Result<bool> {
+    let (words, next) = decoder.ctrl_words(action, nonce)?;
+    for w in words {
+        lin::ctrl_write(tap, node, w)?;
+    }
+    Ok(next)
+}
+
+/// ARM, then poll STATUS until the instrument reports itself armed — the
+/// documented idiom, because CTRL crosses into the core clock through a
+/// synchroniser and `armed` rises a few clocks after the latching write.
+pub fn arm_and_wait<T: Tap>(
+    tap: &mut T,
+    node: &Node,
+    decoder: &dyn Decoder,
+    nonce: bool,
+) -> Result<(u32, bool)> {
+    let next = apply_ctrl(tap, node, decoder, &Ctrl::Arm, nonce)?;
+    for polls in 1..=64u32 {
+        let chunks = status_chunks(tap, node)?;
+        if decoder.is_armed(&chunks) == Some(true) {
+            return Ok((polls, next));
+        }
+    }
+    Err(HostError::Transport(
+        "the instrument never reported itself armed".into(),
+    ))
+}
+
+/// Drain a live instrument into a capture container: the decoded header summary
+/// and the data region as native records. Refuses an instrument whose decoder
+/// exposes no capturable record region.
+pub fn capture<T: Tap>(
+    tap: &mut T,
+    node: &Node,
+    ident: &Ident,
+    decoder: &dyn Decoder,
+    run_mode: RunMode,
+    seed: Option<u32>,
+) -> Result<Capture> {
+    let head = drain_region(tap, node, decoder.header_region())?;
+    let header_summary = decoder.header_summary(&head);
+
+    let mut payload = None;
+    for r in 0..ident.region_count {
+        if r == decoder.header_region() {
+            continue;
+        }
+        let words = drain_region(tap, node, r)?;
+        if let Some(sr) = decoder.to_records(r, &words) {
+            payload = Some(sr);
+            break;
+        }
+    }
+    let (schema, records) = payload.ok_or_else(|| {
+        HostError::Refused("instrument exposes no capturable record region".into())
+    })?;
+
+    Ok(Capture::new(
+        run_mode,
+        ident.instrument_id,
+        ident.instrument_version,
+        ident.proto_version,
+        ident.core_clock_hz,
+        seed,
+        header_summary,
+        schema,
+        records,
+    ))
 }
